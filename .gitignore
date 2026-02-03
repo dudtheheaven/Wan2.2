@@ -4,4 +4,8 @@ __pycache__/
 tmp_examples*
 new_checkpoint*
 batch_test*
-nohup*
+nohup*wan/Wan2.2-T2V-A14B/
+data/
+*.backup
+wan/Wan2.2-T2V-A14B/
+data/
