@@ -71,7 +71,6 @@ def _get_gpu_inventory_string():
         c = Counter([x.strip() for x in out if x.strip()])
         if not c:
             return None
-        # stable ordering
         parts = [f"{k}x{v}" for k, v in sorted(c.items(), key=lambda kv: kv[0])]
         return ", ".join(parts)
     except Exception:
@@ -113,7 +112,6 @@ def _validate_args(args):
 
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(0, sys.maxsize)
 
-    # Size check (as original)
     if "s2v" not in args.task:
         assert args.size in SUPPORTED_SIZES[args.task], (
             f"Unsupport size {args.size} for task {args.task}, "
@@ -184,31 +182,41 @@ def _init_logging(rank: int):
         logging.basicConfig(level=logging.ERROR)
 
 
-def _allreduce_max_float(x: float):
+# ===== scy modi: always barrier with explicit device_ids =====
+def _dist_barrier(local_rank: int):
+    if dist.is_initialized():
+        dist.barrier()
+
+
+# ===== scy modi: allreduce on the correct local device =====
+def _allreduce_max_float(x: float, local_rank: int):
     if not dist.is_initialized():
         return x
-    t = torch.tensor([x], device="cuda")
+    dev = torch.device("cuda", local_rank)
+    t = torch.tensor([x], device=dev)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 
 
-def _broadcast_string_from_rank0(s: str, rank: int):
+# ===== scy modi: seed broadcast via CUDA tensor (avoid broadcast_object_list) =====
+def _broadcast_seed_int64(seed: int, rank: int, local_rank: int) -> int:
     if not dist.is_initialized():
-        return s
-    obj = [s if rank == 0 else None]
-    dist.broadcast_object_list(obj, src=0)
-    return obj[0]
+        return seed
+    dev = torch.device("cuda", local_rank)
+    t = torch.tensor([seed if rank == 0 else 0], device=dev, dtype=torch.int64)
+    dist.broadcast(t, src=0)
+    return int(t.item())
 
 
 def generate(args):
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     local_rank = int(os.getenv("LOCAL_RANK", 0))
-    device = local_rank
+    device_id = local_rank  # keep original semantics
 
     _init_logging(rank)
 
-    # default offload_model behavior (same as your original)
+    # default offload_model behavior
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
         if rank == 0:
@@ -217,24 +225,34 @@ def generate(args):
     # distributed init
     if world_size > 1:
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://", rank=rank, world_size=world_size)
+        _ = torch.cuda.current_device()  # scy modi (force context)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+        )
+        print(f"[rank{rank}] after init_process_group", flush=True)  # scy modi
     else:
         assert not (args.t5_fsdp or args.dit_fsdp), "t5_fsdp/dit_fsdp need torchrun multi-process."
         assert not (args.ulysses_size > 1), "ulysses_size > 1 needs torchrun multi-process."
 
+    # ulysses group
     if args.ulysses_size > 1:
         assert args.ulysses_size == world_size, "ulysses_size must equal WORLD_SIZE."
+        print(f"[rank{rank}] before init_distributed_group", flush=True)  # scy modi
         init_distributed_group()
+        print(f"[rank{rank}] after init_distributed_group", flush=True)  # scy modi (moved here)
 
     cfg = WAN_CONFIGS[args.task]
     if args.ulysses_size > 1:
         assert cfg.num_heads % args.ulysses_size == 0, f"`{cfg.num_heads=}` not divisible by `{args.ulysses_size=}`."
 
-    # seed broadcast (so all ranks use same seed)
+    # ===== scy modi: barrier + seed broadcast using CUDA tensor =====
     if dist.is_initialized():
-        base_seed = [args.base_seed] if rank == 0 else [None]
-        dist.broadcast_object_list(base_seed, src=0)
-        args.base_seed = base_seed[0]
+        _dist_barrier(local_rank)  # scy modi
+        args.base_seed = _broadcast_seed_int64(args.base_seed, rank, local_rank)  # scy modi
+        _dist_barrier(local_rank)  # scy modi
 
     # prepare optional prompt expander
     prompt_expander = None
@@ -266,27 +284,18 @@ def generate(args):
     if rank == 0:
         os.makedirs(args.out_dir, exist_ok=True)
 
-    # GPU inventory string (once)
+    # GPU inventory string (rank0 only)
     gpu_inv = _get_gpu_inventory_string() if rank == 0 else None
-    if dist.is_initialized():
-        gpu_inv = _broadcast_string_from_rank0(gpu_inv, rank)
 
-    # prompt list (single prompt or file)
+    # ===== scy: prompt list =====
     if args.prompt_file is not None:
-        if rank == 0:
-            prompts = _load_prompts_from_file(args.prompt_file)
-            if not prompts:
-                raise ValueError(f"No valid prompts found in: {args.prompt_file}")
-        else:
-            prompts = None
-        if dist.is_initialized():
-            obj = [prompts] if rank == 0 else [None]
-            dist.broadcast_object_list(obj, src=0)
-            prompts = obj[0]
+        prompts = _load_prompts_from_file(args.prompt_file)
+        if not prompts:
+            raise ValueError(f"No valid prompts found in: {args.prompt_file}")
     else:
         prompts = [args.prompt]
 
-    # ===== Build pipeline ONCE (important: don’t reload weights per prompt) =====
+    # ===== Build pipeline ONCE =====
     pipeline = None
     if "t2v" in args.task:
         if rank == 0:
@@ -294,7 +303,7 @@ def generate(args):
         pipeline = wan.WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
-            device_id=device,
+            device_id=device_id,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
             dit_fsdp=args.dit_fsdp,
@@ -308,7 +317,7 @@ def generate(args):
         pipeline = wan.WanTI2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
-            device_id=device,
+            device_id=device_id,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
             dit_fsdp=args.dit_fsdp,
@@ -322,7 +331,7 @@ def generate(args):
         pipeline = wan.WanAnimate(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
-            device_id=device,
+            device_id=device_id,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
             dit_fsdp=args.dit_fsdp,
@@ -337,7 +346,7 @@ def generate(args):
         pipeline = wan.WanS2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
-            device_id=device,
+            device_id=device_id,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
             dit_fsdp=args.dit_fsdp,
@@ -351,7 +360,7 @@ def generate(args):
         pipeline = wan.WanI2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
-            device_id=device,
+            device_id=device_id,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
             dit_fsdp=args.dit_fsdp,
@@ -363,10 +372,10 @@ def generate(args):
     # metrics aggregation (rank0 only)
     per_prompt_results = []
 
-    # ===== MAIN LOOP: prompt-by-prompt =====
+    # ===== MAIN LOOP =====
     for idx, raw_prompt in enumerate(prompts):
-        # prompt extend (rank0) then broadcast
         prompt_to_use = raw_prompt
+
         if args.use_prompt_extend and prompt_expander is not None:
             if rank == 0:
                 logging.info("Extending prompt ...")
@@ -382,15 +391,15 @@ def generate(args):
                     prompt_to_use = raw_prompt
                 else:
                     prompt_to_use = prompt_output.prompt
-            prompt_to_use = _broadcast_string_from_rank0(prompt_to_use, rank)
+            # (kept disabled) prompt broadcast could be added later if needed
 
         if rank == 0:
             logging.info(f"[{idx+1}/{len(prompts)}] Input prompt: {prompt_to_use}")
 
         # measure start
         if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats(device)
-        torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats(local_rank)  # scy modi
+        torch.cuda.synchronize(local_rank)  # scy modi
         start_time = time.perf_counter()
 
         # generate
@@ -469,21 +478,24 @@ def generate(args):
             )
 
         # measure end
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(local_rank)  # scy modi
         elapsed = time.perf_counter() - start_time
-        peak_alloc = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-        peak_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+        peak_alloc = torch.cuda.max_memory_allocated(local_rank) / (1024 ** 3)  # scy modi
+        peak_reserved = torch.cuda.max_memory_reserved(local_rank) / (1024 ** 3)  # scy modi
 
-        # multi-gpu: take MAX across ranks (safest for "GPU Mem" and time)
-        elapsed_max = _allreduce_max_float(elapsed)
-        peak_alloc_max = _allreduce_max_float(peak_alloc)
-        peak_reserved_max = _allreduce_max_float(peak_reserved)
+        # multi-gpu: take MAX across ranks
+        elapsed_max = _allreduce_max_float(elapsed, local_rank)  # scy modi
+        peak_alloc_max = _allreduce_max_float(peak_alloc, local_rank)  # scy modi
+        peak_reserved_max = _allreduce_max_float(peak_reserved, local_rank)  # scy modi
 
         # save (rank0 only)
         if rank == 0:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             prompt_slug = prompt_to_use.replace(" ", "_").replace("/", "_")[:50]
-            base_name = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_p{idx:04d}_{prompt_slug}_{ts}"
+            base_name = (
+                f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_"
+                f"{args.ulysses_size}_p{idx:04d}_{prompt_slug}_{ts}"
+            )
             video_path = os.path.join(args.out_dir, base_name + ".mp4")
             metrics_path = os.path.join(args.out_dir, base_name + ".metrics.json")
 
@@ -508,19 +520,15 @@ def generate(args):
                 "video_path": video_path if args.save_videos else None,
             }
 
-            # print one-line JSON (easy parsing)
             logging.info("RUN_METRICS_JSON=" + json.dumps(result, ensure_ascii=False))
 
-            # save metrics file
             with open(metrics_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
 
-            # append to jsonl
             jsonl_path = os.path.join(args.out_dir, "all_metrics.jsonl")
             with open(jsonl_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
-            # save video (optional)
             if args.save_videos:
                 logging.info(f"Saving generated video to {video_path}")
                 save_video(
@@ -542,9 +550,9 @@ def generate(args):
         # cleanup per-iter
         del video
         if dist.is_initialized():
-            dist.barrier()
+            _dist_barrier(local_rank)  # scy modi
 
-    # ===== summary (rank0 only): average complexity =====
+    # ===== summary (rank0 only) =====
     if rank == 0:
         def _avg(key):
             vals = [r[key] for r in per_prompt_results if r.get(key) is not None]
@@ -568,9 +576,9 @@ def generate(args):
         logging.info("SUMMARY_AVG_JSON=" + json.dumps(summary, ensure_ascii=False))
 
     # teardown
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(local_rank)  # scy modi
     if dist.is_initialized():
-        dist.barrier()
+        _dist_barrier(local_rank)  # scy modi
         dist.destroy_process_group()
 
     if rank == 0:
